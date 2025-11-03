@@ -1,0 +1,21 @@
+[workspace]
+authors = ["Kỳ <>"]
+channels = ["conda-forge"]
+name = "owlv2_pt"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+accelerate = ">=1.11.0,<2"
+marimo = ">=0.17.6,<0.18"
+mcp = ">=1.19.0,<2"
+pillow = ">=12.0.0,<13"
+python-lsp-ruff = ">=2.3.0,<3"
+python-lsp-server = ">=1.13.1,<2"
+pytorch = ">=2.8.0,<3"
+torchcodec = ">=0.8.1,<0.9"
+torchvision = ">=0.24.0,<0.25"
+transformers = ">=4.57.1,<5"
+typer = ">=0.20.0,<0.21"
