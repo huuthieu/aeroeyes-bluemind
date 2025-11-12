@@ -5,7 +5,7 @@ description = "zaloai"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "matplotlib>=3.10.7",
+   "matplotlib>=3.10.7",
     "numpy>=2.3.4",
     "opencv-python>=4.11.0.86",
     "pandas>=2.3.3",
@@ -19,4 +19,6 @@ dependencies = [
     "transformers>=4.57.1",
     "pillow>=12.0.0",
     "tqdm>=4.67.1",
+    "jupyterlab>=4.4.10",
+    "albumentations>=1.4.0",
 ]
