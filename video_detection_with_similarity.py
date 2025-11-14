@@ -128,7 +128,8 @@ class VideoDetectionWithSimilarityPipeline:
         model_path: str = "yoloe-11l-seg-pf.pt",
         output_dir: str = "detection_results",
         embedding_model: str = "facebook/dinov2-base",
-        similarity_threshold: float = 0.5
+        similarity_threshold: float = 0.5,
+        multi_ref_mode: str = "any"  # "any" or "all"
     ):
         """
         Initialize the pipeline
@@ -138,27 +139,103 @@ class VideoDetectionWithSimilarityPipeline:
             output_dir: Directory for outputs
             embedding_model: Vision model for embeddings
             similarity_threshold: Minimum similarity score to keep detections
+            multi_ref_mode: How to combine multiple references:
+                           - "any": keep object if matches ANY reference (OR logic)
+                           - "all": keep object if matches ALL references (AND logic)
         """
         self.detection_model = YOLOE(model_path)
         self.embedding_extractor = ImageEmbeddingExtractor(model_name=embedding_model)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
         self.similarity_threshold = similarity_threshold
-        self.reference_embedding = None
+        self.reference_embeddings = {}  # Dict to store multiple references
+        self.multi_ref_mode = multi_ref_mode
 
         print(f"Similarity threshold: {similarity_threshold}")
+        print(f"Multi-reference mode: {multi_ref_mode}")
 
-    def set_reference_object(self, reference_image_path: str):
+    def set_reference_object(self, reference_image_path: str, reference_name: str = None):
         """
-        Set reference object for similarity comparison
+        Set a single reference object for similarity comparison
 
         Args:
             reference_image_path: Path to reference image
+            reference_name: Name/identifier for this reference (defaults to filename)
         """
-        print(f"\n📌 Loading reference object: {reference_image_path}")
+        reference_path = Path(reference_image_path)
+        if not reference_path.exists():
+            raise FileNotFoundError(f"Reference image not found: {reference_image_path}")
+
+        if reference_name is None:
+            reference_name = reference_path.stem
+
+        print(f"\n📌 Loading reference object '{reference_name}': {reference_image_path}")
         reference_image = Image.open(reference_image_path).convert('RGB')
-        self.reference_embedding = self.embedding_extractor.extract_embedding(reference_image)
-        print("✓ Reference embedding extracted")
+        embedding = self.embedding_extractor.extract_embedding(reference_image)
+        self.reference_embeddings[reference_name] = embedding
+        print(f"✓ Reference '{reference_name}' embedding extracted")
+
+    def set_reference_objects(self, reference_paths: List[str], reference_names: List[str] = None):
+        """
+        Set multiple reference objects for similarity comparison
+
+        Args:
+            reference_paths: List of paths to reference images
+            reference_names: List of names for references (defaults to filenames)
+        """
+        if reference_names is None:
+            reference_names = [Path(p).stem for p in reference_paths]
+
+        print(f"\n📌 Loading {len(reference_paths)} reference objects...")
+        for ref_path, ref_name in zip(reference_paths, reference_names):
+            self.set_reference_object(ref_path, ref_name)
+        print(f"✓ All {len(self.reference_embeddings)} references loaded")
+
+    def _check_similarity_match(self, crop_embedding: torch.Tensor) -> Tuple[bool, Dict]:
+        """
+        Check if crop embedding matches reference(s) based on multi_ref_mode.
+        Uses vectorized operations for efficiency with multiple references.
+
+        Args:
+            crop_embedding: Embedding of detected crop [1, dim]
+
+        Returns:
+            Tuple of (matches: bool, similarity_scores: dict)
+        """
+        if not self.reference_embeddings:
+            raise RuntimeError("No reference objects set. Call set_reference_object(s) first.")
+
+        # Vectorized similarity computation
+        ref_names = list(self.reference_embeddings.keys())
+        ref_embeddings = torch.stack([
+            self.reference_embeddings[name].squeeze(0)
+            for name in ref_names
+        ])  # Shape: [num_refs, dim]
+
+        # Normalize for cosine similarity
+        crop_norm = F.normalize(crop_embedding, dim=1)  # [1, dim]
+        refs_norm = F.normalize(ref_embeddings, dim=1)  # [num_refs, dim]
+
+        # Vectorized cosine similarity: [1, dim] @ [dim, num_refs] = [1, num_refs]
+        similarities_tensor = torch.mm(crop_norm, refs_norm.t()).squeeze(0)  # [num_refs]
+
+        # Convert to dict
+        similarities = {
+            ref_names[i]: similarities_tensor[i].item()
+            for i in range(len(ref_names))
+        }
+
+        # Determine if this detection passes the filter
+        if self.multi_ref_mode == "any":
+            # Keep if matches ANY reference
+            matches = any(sim >= self.similarity_threshold for sim in similarities.values())
+        elif self.multi_ref_mode == "all":
+            # Keep if matches ALL references
+            matches = all(sim >= self.similarity_threshold for sim in similarities.values())
+        else:
+            raise ValueError(f"Unknown multi_ref_mode: {self.multi_ref_mode}")
+
+        return matches, similarities
 
     def process_video(
         self,
@@ -181,8 +258,8 @@ class VideoDetectionWithSimilarityPipeline:
         Returns:
             Dictionary with processing statistics
         """
-        if self.reference_embedding is None:
-            raise RuntimeError("Reference object not set. Call set_reference_object() first.")
+        if not self.reference_embeddings:
+            raise RuntimeError("Reference object(s) not set. Call set_reference_object(s) first.")
 
         video_path = Path(video_path)
         if not video_path.exists():
@@ -250,24 +327,24 @@ class VideoDetectionWithSimilarityPipeline:
                         crop_pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
                         crop_embedding = self.embedding_extractor.extract_embedding(crop_pil)
 
-                        # Compute similarity
-                        similarity = self.embedding_extractor.compute_similarity(
-                            self.reference_embedding,
-                            crop_embedding,
-                            metric="cosine"
-                        )
+                        # Check similarity match with reference(s)
+                        matches, similarities = self._check_similarity_match(crop_embedding)
 
                         total_detections += 1
 
                         # Filter by similarity threshold
-                        if similarity >= self.similarity_threshold:
+                        if matches:
                             total_filtered += 1
+
+                            # Get the best similarity score for display
+                            best_sim = max(similarities.values())
 
                             detection = {
                                 "class": cls_name,
                                 "class_id": cls_id,
                                 "confidence": conf,
-                                "similarity": similarity,
+                                "similarities": similarities,  # All similarity scores
+                                "best_similarity": best_sim,
                                 "bbox": {
                                     "x1": xyxy[0],
                                     "y1": xyxy[1],
@@ -281,7 +358,7 @@ class VideoDetectionWithSimilarityPipeline:
 
                             # Draw bbox on frame (green for passed similarity)
                             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                            label = f"{cls_name} {conf:.2f} sim:{similarity:.2f}"
+                            label = f"{cls_name} {conf:.2f} sim:{best_sim:.2f}"
                             cv2.putText(
                                 annotated_frame, label, (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2
@@ -345,27 +422,49 @@ def main():
     # Configuration
     MODEL_PATH = "yoloe-11l-seg-pf.pt"
     VIDEO_PATH = "/Users/thieu.do/Desktop/learning/zaloAI/train/samples/Backpack_0/drone_video.mp4"
-    REFERENCE_IMAGE = "train/samples/Backpack_0/object_images/img_3.jpg"  # Set your reference image path
     OUTPUT_DIRECTORY = "detection_results"
     SIMILARITY_THRESHOLD = 0.1  # Adjust based on your needs
     EMBEDDING_MODEL = "facebook/dinov2-base"  # Options: dinov2-base, dinov2-large, dinov3-convnext-tiny-pretrain-lvd1689m
     FRAME_SKIP = 1
     DETECTION_CONF = 0.5
 
+    # ===== OPTION 1: Single reference image =====
+    # REFERENCE_IMAGES = ["train/samples/Backpack_0/object_images/img_3.jpg"]
+    # MULTI_REF_MODE = "any"
+
+    # ===== OPTION 2: Multiple reference images (keep if matches ANY) =====
+    REFERENCE_IMAGES = [
+        "train/samples/Backpack_0/object_images/img_3.jpg",
+        "train/samples/Backpack_0/object_images/img_1.jpg",
+        "train/samples/Backpack_0/object_images/img_2.jpg",
+    ]
+    MULTI_REF_MODE = "any"  # Keep object if matches ANY reference (OR logic)
+
+    # ===== OPTION 3: Multiple reference images (keep if matches ALL) =====
+    # REFERENCE_IMAGES = [
+    #     "train/samples/Backpack_0/object_images/img_3.jpg",
+    #     "train/samples/Backpack_0/object_images/img_1.jpg",
+    # ]
+    # MULTI_REF_MODE = "all"  # Keep object if matches ALL references (AND logic)
+
     # Initialize pipeline
     pipeline = VideoDetectionWithSimilarityPipeline(
         model_path=MODEL_PATH,
         output_dir=OUTPUT_DIRECTORY,
         embedding_model=EMBEDDING_MODEL,
-        similarity_threshold=SIMILARITY_THRESHOLD
+        similarity_threshold=SIMILARITY_THRESHOLD,
+        multi_ref_mode=MULTI_REF_MODE
     )
 
-    # Set reference object
+    # Set reference object(s)
     try:
-        pipeline.set_reference_object(REFERENCE_IMAGE)
-    except FileNotFoundError:
-        print(f"Error: Reference image not found at {REFERENCE_IMAGE}")
-        print("Please set a valid path to your reference object image.")
+        if len(REFERENCE_IMAGES) == 1:
+            pipeline.set_reference_object(REFERENCE_IMAGES[0])
+        else:
+            pipeline.set_reference_objects(REFERENCE_IMAGES)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        print("Please set valid paths to your reference object images.")
         return
 
     # Process video
@@ -382,6 +481,8 @@ def main():
         print("DETECTION WITH SIMILARITY FILTERING RESULTS")
         print("=" * 80)
         print(f"Video: {stats['video_path']}")
+        print(f"Reference mode: {MULTI_REF_MODE}")
+        print(f"Number of references: {len(REFERENCE_IMAGES)}")
         print(f"Total Detections: {stats['total_detections']}")
         print(f"Filtered Detections (similarity > {stats['similarity_threshold']}): {stats['filtered_detections']}")
         print(f"Filtering Ratio: {stats['filtering_ratio']:.2%}")
